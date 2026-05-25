@@ -1,0 +1,5 @@
+aiogram
+flask
+stripe
+python-dotenv
+gunicorn
