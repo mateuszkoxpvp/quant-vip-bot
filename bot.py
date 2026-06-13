@@ -4,8 +4,8 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
 import os
 
-BOT_TOKEN = os.getenv(8849525151:AAFEMm0b_s4DHzfzq8WvTcOICHKB6k720Oc)
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+print("TOKEN:", BOT_TOKEN[:15])
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
