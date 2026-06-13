@@ -24,25 +24,25 @@ async def start(message: types.Message):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔥 Lifetime: 1.800 PLN / Lebenslang",
+                    text="🔥 Lifetime: 300 € / Lebenslang",
                     url=f"{LIFETIME_LINK}?client_reference_id={telegram_id}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📅 Monatlich: 299 PLN / 1 Monat",
+                    text="📅 Monatlich: 29 € / Monat",
                     url=f"{MONTHLY_LINK}?client_reference_id={telegram_id}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📆 3 Monate: 799 PLN / 3 Monate",
+                    text="📆 3 Monate: 59 € / 3 Monate",
                     url=f"{THREE_MONTH_LINK}?client_reference_id={telegram_id}"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🗓️ 6 Monate: 1.499 PLN / 6 Monate",
+                    text="🗓️ 6 Monate: 99 € / 6 Monate",
                     url=f"{SIX_MONTH_LINK}?client_reference_id={telegram_id}"
                 )
             ]
@@ -51,7 +51,7 @@ async def start(message: types.Message):
 
     await message.answer(
         f"Willkommen, {message.from_user.first_name}!\n\n"
-        f"Um der VIP-Gruppe beizutreten, wählen Sie bitte einen der folgenden Pläne:",
+        "Um der exklusiven VIP-Gruppe beizutreten, wählen Sie bitte eines der folgenden Abonnements:",
         reply_markup=keyboard
     )
 
