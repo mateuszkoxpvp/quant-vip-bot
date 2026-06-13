@@ -1,4 +1,5 @@
 aiogram
-flask
+fastapi
+uvicorn
 stripe
 python-dotenv
