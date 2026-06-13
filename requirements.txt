@@ -2,8 +2,3 @@ aiogram
 flask
 stripe
 python-dotenv
-gunicorn
-aiogram
-fastapi
-uvicorn
-stripe
