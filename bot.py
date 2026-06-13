@@ -9,7 +9,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-PAYMENT_LINK =https://buy.stripe.com/dRmaEW0VMb684J77KnfAc00
+PAYMENT_LINK = "https://buy.stripe.com/dRmaEW0VMb684J77KnfAc00"
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
