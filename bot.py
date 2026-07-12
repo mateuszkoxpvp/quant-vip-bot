@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import sys
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -24,6 +23,7 @@ REQUIRED_ENV_VARS = (
     "PAYMENT_LINK_3_MONTHS",
     "PAYMENT_LINK_6_MONTHS",
     "PAYMENT_LINK_LIFETIME",
+    "STRIPE_WEBHOOK_SECRET",
 )
 
 
@@ -34,10 +34,16 @@ class Settings:
     payment_link_3_months: str
     payment_link_6_months: str
     payment_link_lifetime: str
+    stripe_webhook_secret: str
 
 
 dp = Dispatcher()
 settings: Settings | None = None
+
+
+def set_settings(app_settings: Settings) -> None:
+    global settings
+    settings = app_settings
 
 
 def validate_payment_link(env_name: str, value: str) -> str:
@@ -69,6 +75,7 @@ def load_settings() -> Settings:
         payment_link_lifetime=validate_payment_link(
             "PAYMENT_LINK_LIFETIME", os.environ["PAYMENT_LINK_LIFETIME"]
         ),
+        stripe_webhook_secret=os.environ["STRIPE_WEBHOOK_SECRET"],
     )
 
 
@@ -87,6 +94,15 @@ def build_stripe_link(payment_link: str, client_reference_id: int) -> str:
     ]
     query_params.append(("client_reference_id", str(client_reference_id)))
     return urlunparse(parsed_url._replace(query=urlencode(query_params)))
+
+
+def create_bot(app_settings: Settings) -> Bot:
+    return Bot(token=app_settings.bot_token)
+
+
+async def run_polling(bot: Bot) -> None:
+    logger.info("Starting Telegram bot in long polling mode.")
+    await dp.start_polling(bot)
 
 
 @dp.message(Command("start"))
@@ -139,19 +155,17 @@ async def start(message: types.Message):
 
 
 async def main():
-    global settings
-
     try:
-        settings = load_settings()
+        app_settings = load_settings()
     except RuntimeError as error:
         logger.error("%s", error)
-        sys.exit(1)
+        raise SystemExit(1) from error
 
-    bot = Bot(token=settings.bot_token)
-    logger.info("Starting Telegram bot in long polling mode.")
+    set_settings(app_settings)
+    bot = create_bot(app_settings)
 
     try:
-        await dp.start_polling(bot)
+        await run_polling(bot)
     except Exception:
         logger.exception("Bot stopped because of an unexpected error.")
         raise

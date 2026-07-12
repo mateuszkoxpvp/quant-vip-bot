@@ -1,2 +1,5 @@
 aiogram==3.29.1
+fastapi==0.139.0
 python-dotenv==1.2.2
+stripe==15.3.0
+uvicorn==0.51.0
