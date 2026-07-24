@@ -102,6 +102,7 @@ def create_bot(app_settings: Settings) -> Bot:
 
 async def run_polling(bot: Bot) -> None:
     logger.info("Starting Telegram bot in long polling mode.")
+    await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
 

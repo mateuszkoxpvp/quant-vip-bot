@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import stripe
 from sqlalchemy import create_engine, select
@@ -99,6 +99,21 @@ class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
         response = await app_module.health(FakeRequest())
 
         self.assertEqual(response.status_code, 503)
+
+
+class BotPollingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_polling_clears_webhook_before_starting_polling(self) -> None:
+        bot = AsyncMock()
+
+        with patch.object(
+            bot_module.dp,
+            "start_polling",
+            new_callable=AsyncMock,
+        ) as start_polling:
+            await bot_module.run_polling(bot)
+
+        bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+        start_polling.assert_awaited_once_with(bot)
 
 
 class StripeWebhookTests(unittest.IsolatedAsyncioTestCase):
