@@ -5,10 +5,14 @@ from contextlib import asynccontextmanager
 
 import stripe
 import uvicorn
-from fastapi import FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from bot import create_bot, get_settings, load_settings, run_polling, set_settings
+from db import close_db, get_db_session, init_db_from_env
+from stripe_service import InvalidStripeEventError, process_verified_event
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,7 @@ async def stop_polling_task(polling_task: asyncio.Task[None]) -> None:
 async def lifespan(app: FastAPI):
     try:
         app_settings = load_settings()
+        init_db_from_env()
     except RuntimeError as error:
         logger.error("%s", error)
         raise
@@ -68,6 +73,7 @@ async def lifespan(app: FastAPI):
         await bot.session.close()
         app.state.bot = None
         app.state.polling_task = None
+        close_db()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -88,6 +94,7 @@ async def health(request: Request) -> JSONResponse:
 async def stripe_webhook(
     request: Request,
     stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
+    db: Session = Depends(get_db_session),
 ) -> JSONResponse:
     if not stripe_signature:
         logger.warning("Stripe webhook rejected: missing Stripe-Signature header.")
@@ -112,9 +119,37 @@ async def stripe_webhook(
 
     event_id = event.get("id")
     event_type = event.get("type")
-    logger.info("Verified Stripe event id=%s type=%s", event_id, event_type)
 
-    return JSONResponse(status_code=200, content={"received": True})
+    try:
+        result = process_verified_event(db, event, get_settings())
+    except InvalidStripeEventError:
+        db.rollback()
+        logger.warning("Stripe webhook rejected: verified event is missing id or type.")
+        return JSONResponse(status_code=400, content={"detail": "Invalid event."})
+    except SQLAlchemyError:
+        db.rollback()
+        logger.error("Stripe webhook failed while processing event id=%s.", event_id)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Could not process Stripe event."},
+        )
+
+    logger.info(
+        "Verified Stripe event id=%s type=%s processed=%s reason=%s",
+        event_id,
+        event_type,
+        result.processed,
+        result.reason,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "received": True,
+            "processed": result.processed,
+            "reason": result.reason,
+        },
+    )
 
 
 def main() -> None:
