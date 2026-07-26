@@ -32,14 +32,38 @@ class StripeProcessResult:
     reason: str | None = None
 
 
-def serialize_stripe_event(event: Mapping[str, Any]) -> dict[str, Any]:
-    if hasattr(event, "to_dict_recursive"):
-        return event.to_dict_recursive()
+def stripe_value_to_plain(value: Any) -> Any:
+    to_dict_recursive = getattr(value, "to_dict_recursive", None)
+    if callable(to_dict_recursive):
+        return to_dict_recursive()
 
-    return dict(event)
+    private_to_dict_recursive = getattr(value, "_to_dict_recursive", None)
+    if callable(private_to_dict_recursive):
+        return private_to_dict_recursive()
+
+    if isinstance(value, Mapping):
+        return {key: stripe_value_to_plain(item) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [stripe_value_to_plain(item) for item in value]
+
+    return value
 
 
-def build_stripe_event(event: Mapping[str, Any]) -> StripeEvent:
+def normalize_stripe_event(event: Mapping[str, Any] | Any) -> dict[str, Any]:
+    event_data = stripe_value_to_plain(event)
+    if not isinstance(event_data, Mapping):
+        raise InvalidStripeEventError("Verified Stripe event must be a mapping.")
+
+    return dict(event_data)
+
+
+def serialize_stripe_event(event: Mapping[str, Any] | Any) -> dict[str, Any]:
+    return normalize_stripe_event(event)
+
+
+def build_stripe_event(event: Mapping[str, Any] | Any) -> StripeEvent:
+    event = normalize_stripe_event(event)
     event_id = event.get("id")
     event_type = event.get("type")
 
@@ -69,9 +93,10 @@ def duplicate_event_result(db: Session, event_id: str) -> StripeProcessResult:
 
 def process_verified_event(
     db: Session,
-    event: Mapping[str, Any],
+    event: Mapping[str, Any] | Any,
     settings: Settings,
 ) -> StripeProcessResult:
+    event = normalize_stripe_event(event)
     stripe_event = build_stripe_event(event)
     event_id = stripe_event.stripe_event_id
     event_type = stripe_event.event_type

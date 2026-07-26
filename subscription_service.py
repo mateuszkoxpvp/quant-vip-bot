@@ -148,8 +148,15 @@ def as_plain_mapping(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
 
-    if hasattr(value, "to_dict_recursive"):
-        return value.to_dict_recursive()
+    to_dict_recursive = getattr(value, "to_dict_recursive", None)
+    if callable(to_dict_recursive):
+        converted = to_dict_recursive()
+        return dict(converted) if isinstance(converted, Mapping) else {}
+
+    private_to_dict_recursive = getattr(value, "_to_dict_recursive", None)
+    if callable(private_to_dict_recursive):
+        converted = private_to_dict_recursive()
+        return dict(converted) if isinstance(converted, Mapping) else {}
 
     if isinstance(value, Mapping):
         return dict(value)
@@ -182,11 +189,13 @@ def canonical_plan_code(value: Any) -> str:
 
 
 def checkout_session_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    event = as_plain_mapping(event)
     data = as_plain_mapping(event.get("data"))
     return as_plain_mapping(data.get("object"))
 
 
 def stripe_subscription_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    event = as_plain_mapping(event)
     data = as_plain_mapping(event.get("data"))
     return as_plain_mapping(data.get("object"))
 
@@ -441,6 +450,7 @@ def stripe_datetime(value: Any) -> datetime | None:
 
 
 def stripe_event_created(event: Mapping[str, Any], now: datetime) -> datetime:
+    event = as_plain_mapping(event)
     return stripe_datetime(event.get("created")) or now
 
 
@@ -605,6 +615,7 @@ def fulfill_checkout_session_completed(
     stripe_event: StripeEvent,
     settings: Settings,
 ) -> FulfillmentResult:
+    event = as_plain_mapping(event)
     session = checkout_session_from_event(event)
     if not session:
         logger.warning("checkout.session.completed missing data.object.")
@@ -746,6 +757,7 @@ def fulfill_stripe_subscription_event(
     event: Mapping[str, Any],
     stripe_event: StripeEvent,
 ) -> FulfillmentResult:
+    event = as_plain_mapping(event)
     subscription_payload = stripe_subscription_from_event(event)
     stripe_subscription_id = object_id(subscription_payload.get("id"))
     if stripe_subscription_id is None:

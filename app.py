@@ -12,7 +12,11 @@ from sqlalchemy.orm import Session
 
 from bot import create_bot, get_settings, load_settings, run_polling, set_settings
 from db import close_db, get_db_session, init_db_from_env
-from stripe_service import InvalidStripeEventError, process_verified_event
+from stripe_service import (
+    InvalidStripeEventError,
+    normalize_stripe_event,
+    process_verified_event,
+)
 from subscription_access_service import (
     apply_subscription_access_action,
     run_subscription_access_scheduler,
@@ -146,12 +150,16 @@ async def stripe_webhook(
         event = stripe.Webhook.construct_event(
             payload, stripe_signature, webhook_secret
         )
-    except ValueError:
-        logger.warning("Stripe webhook rejected: invalid payload.")
-        return JSONResponse(status_code=400, content={"detail": "Invalid payload."})
+        event = normalize_stripe_event(event)
     except stripe.error.SignatureVerificationError:
         logger.warning("Stripe webhook rejected: invalid signature.")
         return JSONResponse(status_code=400, content={"detail": "Invalid signature."})
+    except InvalidStripeEventError:
+        logger.warning("Stripe webhook rejected: verified event is not a mapping.")
+        return JSONResponse(status_code=400, content={"detail": "Invalid event."})
+    except ValueError:
+        logger.warning("Stripe webhook rejected: invalid payload.")
+        return JSONResponse(status_code=400, content={"detail": "Invalid payload."})
 
     event_id = event.get("id")
     event_type = event.get("type")

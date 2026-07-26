@@ -800,6 +800,52 @@ class StripeWebhookTests(unittest.IsolatedAsyncioTestCase):
             datetime(2026, 8, 24),
         )
 
+    async def test_checkout_completed_accepts_stripe_event_object(self) -> None:
+        event = self.checkout_event(
+            event_id="evt_test_stripe_object",
+            session_id="cs_test_stripe_object",
+            subscription={
+                "id": "sub_test_stripe_object",
+                "status": "active",
+                "current_period_start": 1784937600,
+                "current_period_end": 1787529600,
+            },
+        )
+        stripe_event_object = stripe.Event.construct_from(event, "sk_test")
+
+        with patch.object(
+            app_module.stripe.Webhook,
+            "construct_event",
+            return_value=stripe_event_object,
+        ):
+            with self.session_factory() as db:
+                response = await app_module.stripe_webhook(
+                    FakeRequest(body=json.dumps({"id": event["id"]}).encode()),
+                    stripe_signature="valid-signature",
+                    db=db,
+                )
+                stored_event = db.scalar(
+                    select(StripeEvent).where(
+                        StripeEvent.stripe_event_id == "evt_test_stripe_object"
+                    )
+                )
+                subscription = db.scalar(
+                    select(Subscription).where(
+                        Subscription.stripe_checkout_session_id
+                        == "cs_test_stripe_object"
+                    )
+                )
+
+        body = response_json(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body["processed"])
+        self.assertIsNotNone(stored_event)
+        self.assertIsNotNone(stored_event.processed_at)
+        self.assertEqual(stored_event.event_type, "checkout.session.completed")
+        self.assertIsNotNone(subscription)
+        self.assertEqual(subscription.stripe_subscription_id, "sub_test_stripe_object")
+
     async def test_checkout_completed_sends_group_invite_after_subscription_saved(
         self,
     ) -> None:
