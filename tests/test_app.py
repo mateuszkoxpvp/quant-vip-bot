@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -1364,6 +1365,71 @@ class StripeWebhookTests(unittest.IsolatedAsyncioTestCase):
                 select(Subscription).where(
                     Subscription.stripe_checkout_session_id
                     == "cs_test_payment_link_plan"
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response_json(response)["processed"])
+        self.assertIsNotNone(plan)
+        self.assertIsNotNone(subscription)
+        self.assertEqual(subscription.plan_id, plan.id)
+
+    async def test_plan_can_be_resolved_from_payment_link_id_and_configured_url(
+        self,
+    ) -> None:
+        payment_link_id = "plink_1MonthlyABC123"
+        bot_module.set_settings(
+            replace(
+                TEST_SETTINGS,
+                payment_link_monthly=f"https://buy.stripe.com/{payment_link_id}",
+            )
+        )
+        event = self.checkout_event(
+            event_id="evt_test_payment_link_id_url_config",
+            session_id="cs_test_payment_link_id_url_config",
+            plan_code=None,
+            duration_days=None,
+            payment_link=payment_link_id,
+        )
+
+        with self.session_factory() as db:
+            response = await self.send_event(db, event)
+
+            plan = db.scalar(select(Plan).where(Plan.code == "monthly"))
+            subscription = db.scalar(
+                select(Subscription).where(
+                    Subscription.stripe_checkout_session_id
+                    == "cs_test_payment_link_id_url_config"
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response_json(response)["processed"])
+        self.assertIsNotNone(plan)
+        self.assertIsNotNone(subscription)
+        self.assertEqual(subscription.plan_id, plan.id)
+
+    async def test_plan_can_be_resolved_from_payment_link_id_config(self) -> None:
+        payment_link_id = "plink_1MonthlyXYZ789"
+        bot_module.set_settings(
+            replace(TEST_SETTINGS, payment_link_monthly=payment_link_id)
+        )
+        event = self.checkout_event(
+            event_id="evt_test_payment_link_id_config",
+            session_id="cs_test_payment_link_id_config",
+            plan_code=None,
+            duration_days=None,
+            payment_link=payment_link_id,
+        )
+
+        with self.session_factory() as db:
+            response = await self.send_event(db, event)
+
+            plan = db.scalar(select(Plan).where(Plan.code == "monthly"))
+            subscription = db.scalar(
+                select(Subscription).where(
+                    Subscription.stripe_checkout_session_id
+                    == "cs_test_payment_link_id_config"
                 )
             )
 

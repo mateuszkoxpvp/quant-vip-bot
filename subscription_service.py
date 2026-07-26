@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
+from hashlib import sha256
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -53,6 +54,7 @@ PLAN_PAYMENT_LINK_SETTINGS = {
     "6_months": "payment_link_6_months",
     "lifetime": "payment_link_lifetime",
 }
+PAYMENT_LINK_ID_PATTERN = re.compile(r"plink_[A-Za-z0-9_]+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,11 @@ def payment_link_candidates(value: Any) -> set[str]:
             continue
 
         candidates.add(value_text.lower())
+        candidates.update(
+            match.group(0).lower()
+            for match in PAYMENT_LINK_ID_PATTERN.finditer(value_text)
+        )
+
         parsed_url = urlparse(value_text)
         if parsed_url.scheme and parsed_url.netloc:
             normalized_url = urlunparse(
@@ -244,8 +251,47 @@ def payment_link_candidates(value: Any) -> set[str]:
             path_leaf = parsed_url.path.strip("/").split("/")[-1]
             if path_leaf:
                 candidates.add(path_leaf.lower())
+                candidates.update(
+                    match.group(0).lower()
+                    for match in PAYMENT_LINK_ID_PATTERN.finditer(path_leaf)
+                )
+
+            for _, query_value in parse_qsl(parsed_url.query, keep_blank_values=True):
+                candidates.update(
+                    match.group(0).lower()
+                    for match in PAYMENT_LINK_ID_PATTERN.finditer(query_value)
+                )
+
+            candidates.update(
+                match.group(0).lower()
+                for match in PAYMENT_LINK_ID_PATTERN.finditer(parsed_url.fragment)
+            )
 
     return candidates
+
+
+def mask_identifier(value: str) -> str:
+    if len(value) <= 12:
+        return value
+
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def safe_candidate_label(candidate: str) -> str:
+    if candidate.startswith(("plink_", "price_")):
+        return mask_identifier(candidate)
+
+    parsed_url = urlparse(candidate)
+    if parsed_url.scheme and parsed_url.netloc:
+        digest = sha256(candidate.encode("utf-8")).hexdigest()[:10]
+        return f"url:{parsed_url.netloc.lower()}:sha256:{digest}"
+
+    digest = sha256(candidate.encode("utf-8")).hexdigest()[:10]
+    return f"value:sha256:{digest}"
+
+
+def safe_candidates_for_log(candidates: set[str]) -> list[str]:
+    return sorted(safe_candidate_label(candidate) for candidate in candidates)
 
 
 def plan_code_from_payment_link(
@@ -265,11 +311,30 @@ def plan_code_from_payment_link(
     if not session_candidates:
         return None
 
+    configured_candidates_by_plan: dict[str, set[str]] = {}
     for plan_code, setting_name in PLAN_PAYMENT_LINK_SETTINGS.items():
         configured_candidates = payment_link_candidates(getattr(settings, setting_name))
+        configured_candidates_by_plan[plan_code] = configured_candidates
         if session_candidates & configured_candidates:
+            logger.info(
+                "Resolved plan_code=%s from payment_link candidates match=%s "
+                "session_candidates=%s configured_candidates=%s.",
+                plan_code,
+                safe_candidates_for_log(session_candidates & configured_candidates),
+                safe_candidates_for_log(session_candidates),
+                safe_candidates_for_log(configured_candidates),
+            )
             return plan_code
 
+    logger.info(
+        "Payment link did not match configured plans: session_candidates=%s "
+        "configured_candidates_by_plan=%s.",
+        safe_candidates_for_log(session_candidates),
+        {
+            plan_code: safe_candidates_for_log(configured_candidates)
+            for plan_code, configured_candidates in configured_candidates_by_plan.items()
+        },
+    )
     return None
 
 
@@ -386,6 +451,11 @@ def resolve_plan(
             .limit(1)
         )
         if plan is not None:
+            logger.info(
+                "Resolved plan_code=%s from stripe_price_id candidates=%s.",
+                plan.code,
+                safe_candidates_for_log(price_ids),
+            )
             apply_plan_details(plan, session, metadata, price_ids)
             return plan
 
