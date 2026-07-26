@@ -2,9 +2,9 @@
 
 Telegram bot for presenting Stripe Payment Links for VIP access.
 
-Stage 4 stores verified Stripe Checkout completions in PostgreSQL. The bot still
-uses Telegram long polling. There is no Telegram webhook, automatic group
-invite, or member removal yet.
+Stage 5 stores verified Stripe Checkout completions in PostgreSQL, sends VIP
+group access after successful payment, and regularly revokes access for expired
+or canceled subscriptions. The bot still uses Telegram long polling.
 
 The FastAPI app only receives and verifies Stripe webhooks. Stripe event
 idempotency and storage live in `stripe_service.py`; plan resolution and
@@ -48,12 +48,19 @@ PAYMENT_LINK_3_MONTHS=
 PAYMENT_LINK_6_MONTHS=
 PAYMENT_LINK_LIFETIME=
 STRIPE_WEBHOOK_SECRET=
+TELEGRAM_GROUP_ID=
+GROUP_ID=
+ACCESS_CHECK_INTERVAL_SECONDS=300
 ```
 
 Use Railway's PostgreSQL `DATABASE_URL` for the database connection. Use Stripe
 Payment Link URLs for the `PAYMENT_LINK_*` variables. Use the webhook signing
-secret for `STRIPE_WEBHOOK_SECRET`; it starts with `whsec_`. Do not commit real
-tokens, secrets, database URLs, or private payment links to the repository.
+secret for `STRIPE_WEBHOOK_SECRET`; it starts with `whsec_`. Set
+`TELEGRAM_GROUP_ID` to the numeric private group or supergroup ID, for example
+`-1001234567890`, or to a public `@groupusername`. `GROUP_ID` is a deprecated
+fallback for existing Railway services; prefer `TELEGRAM_GROUP_ID`, which takes
+priority when both are present. Do not commit real tokens, secrets, database
+URLs, group IDs, or private payment links to the repository.
 
 `DATABASE_URL` values starting with `postgres://` or `postgresql://` are
 normalized to SQLAlchemy's `postgresql+psycopg://` driver URL.
@@ -82,8 +89,21 @@ missing, cancelled, stopped, or failed.
 `/stripe/webhook` verifies the Stripe signature using the raw request body,
 stores the verified event in `stripe_events`, and processes
 `checkout.session.completed` events by linking the Stripe Checkout Session to the
-Telegram user from `client_reference_id`. This stage only writes database rows;
-it does not grant Telegram group access yet.
+Telegram user from `client_reference_id`. After the subscription row is saved,
+the app tries to grant Telegram group access.
+
+Telegram bots cannot force-add an arbitrary user to a group by ID. This app
+therefore uses the safest Bot API flow:
+
+```text
+1. If the user already has a pending join request, approve it.
+2. If the user is already in the group, record that state.
+3. Otherwise, create a one-use invite link and send it to the user in Telegram.
+```
+
+If the user blocked the bot, never joined, or the bot lacks group permissions,
+the payment stays saved and the access attempt is recorded for retry by the
+scheduler.
 
 The bot appends `client_reference_id=<telegram_id>` to every Payment Link URL.
 Stripe sends that value back in the `checkout.session.completed` webhook, which
@@ -117,6 +137,19 @@ If `plan_code` is missing, the app tries to resolve the plan from the Payment
 Link and then from a Stripe price ID already stored on a row in `plans`. Unknown
 plans are left unprocessed instead of creating subscriptions with guessed data.
 
+Group access is granted only for Checkout Sessions with
+`payment_status=paid`. `payment_status=no_payment_required` is accepted only for
+explicit trial sessions where the Stripe subscription is `trialing` and Payment
+Link metadata contains a truthy trial flag such as `allow_trial=true`.
+
+Subscription status handling:
+
+```text
+grant: active, trialing
+revoke: canceled, cancelled, incomplete_expired, unpaid
+no-op/grace: past_due, incomplete
+```
+
 ## Database
 
 The first migration creates:
@@ -127,6 +160,8 @@ plans
 subscriptions
 stripe_events
 ```
+
+Later migrations add Telegram access tracking columns to `subscriptions`.
 
 Run migrations locally or on Railway with:
 
@@ -144,6 +179,11 @@ web: python app.py
 
 Keep exactly one Railway replica and one Uvicorn worker. Do not start a separate
 process for the Telegram bot.
+
+The bot must be an administrator of the VIP Telegram group and needs permission
+to invite users and ban users. `ACCESS_CHECK_INTERVAL_SECONDS` controls how often
+the scheduler checks for expired or canceled subscriptions; the default is
+`300`.
 
 Before deploying code that needs the database schema, run:
 

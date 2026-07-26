@@ -13,21 +13,32 @@ from sqlalchemy.orm import Session
 from bot import create_bot, get_settings, load_settings, run_polling, set_settings
 from db import close_db, get_db_session, init_db_from_env
 from stripe_service import InvalidStripeEventError, process_verified_event
+from subscription_access_service import (
+    apply_subscription_access_action,
+    run_subscription_access_scheduler,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def is_polling_healthy(app: FastAPI) -> tuple[bool, str]:
-    polling_task = getattr(app.state, "polling_task", None)
-    if polling_task is None:
+    return task_health(getattr(app.state, "polling_task", None))
+
+
+def is_scheduler_healthy(app: FastAPI) -> tuple[bool, str]:
+    return task_health(getattr(app.state, "access_scheduler_task", None))
+
+
+def task_health(task: asyncio.Task[None] | None) -> tuple[bool, str]:
+    if task is None:
         return False, "missing"
 
-    if polling_task.cancelled():
+    if task.cancelled():
         return False, "cancelled"
 
-    if polling_task.done():
+    if task.done():
         try:
-            exception = polling_task.exception()
+            exception = task.exception()
         except asyncio.CancelledError:
             return False, "cancelled"
 
@@ -50,6 +61,18 @@ async def stop_polling_task(polling_task: asyncio.Task[None]) -> None:
         logger.exception("Telegram polling task stopped with an unexpected error.")
 
 
+async def stop_background_task(task: asyncio.Task[None], task_name: str) -> None:
+    if not task.done():
+        task.cancel()
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        logger.info("%s task cancelled.", task_name)
+    except Exception:
+        logger.exception("%s task stopped with an unexpected error.", task_name)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -63,16 +86,23 @@ async def lifespan(app: FastAPI):
 
     bot = create_bot(app_settings)
     polling_task = asyncio.create_task(run_polling(bot), name="telegram-polling")
+    access_scheduler_task = asyncio.create_task(
+        run_subscription_access_scheduler(bot, app_settings),
+        name="subscription-access-scheduler",
+    )
     app.state.bot = bot
     app.state.polling_task = polling_task
+    app.state.access_scheduler_task = access_scheduler_task
 
     try:
         yield
     finally:
         await stop_polling_task(polling_task)
+        await stop_background_task(access_scheduler_task, "Subscription access scheduler")
         await bot.session.close()
         app.state.bot = None
         app.state.polling_task = None
+        app.state.access_scheduler_task = None
         close_db()
 
 
@@ -82,11 +112,17 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health(request: Request) -> JSONResponse:
     healthy, polling_status = is_polling_healthy(request.app)
-    status_code = 200 if healthy else 503
-    status = "ok" if healthy else "unhealthy"
+    scheduler_healthy, scheduler_status = is_scheduler_healthy(request.app)
+    app_healthy = healthy and scheduler_healthy
+    status_code = 200 if app_healthy else 503
+    status = "ok" if app_healthy else "unhealthy"
     return JSONResponse(
         status_code=status_code,
-        content={"status": status, "polling": polling_status},
+        content={
+            "status": status,
+            "polling": polling_status,
+            "scheduler": scheduler_status,
+        },
     )
 
 
@@ -141,6 +177,21 @@ async def stripe_webhook(
         result.processed,
         result.reason,
     )
+
+    if result.processed and result.subscription_id and result.access_action:
+        try:
+            await apply_subscription_access_action(
+                db=db,
+                bot=getattr(request.app.state, "bot", None),
+                settings=get_settings(),
+                subscription_id=result.subscription_id,
+                action=result.access_action,
+            )
+        except Exception:
+            logger.exception(
+                "Telegram access sync failed for subscription_id=%s.",
+                result.subscription_id,
+            )
 
     return JSONResponse(
         status_code=200,

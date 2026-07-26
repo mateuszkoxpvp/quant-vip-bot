@@ -10,7 +10,10 @@ from sqlalchemy.orm import Session
 
 from bot import Settings
 from models import StripeEvent
-from subscription_service import fulfill_checkout_session_completed
+from subscription_service import (
+    fulfill_checkout_session_completed,
+    fulfill_stripe_subscription_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,9 @@ class InvalidStripeEventError(ValueError):
 class StripeProcessResult:
     processed: bool
     telegram_id: int | None = None
+    subscription_id: int | None = None
+    subscription_status: str | None = None
+    access_action: str | None = None
     reason: str | None = None
 
 
@@ -75,20 +81,42 @@ def process_verified_event(
             db.add(stripe_event)
             db.flush()
 
+            if event_type == "checkout.session.completed":
+                fulfillment_result = fulfill_checkout_session_completed(
+                    db=db,
+                    event=event,
+                    stripe_event=stripe_event,
+                    settings=settings,
+                )
+                return StripeProcessResult(
+                    processed=fulfillment_result.processed,
+                    telegram_id=fulfillment_result.telegram_id,
+                    subscription_id=fulfillment_result.subscription_id,
+                    subscription_status=fulfillment_result.subscription_status,
+                    access_action=fulfillment_result.access_action,
+                    reason=fulfillment_result.reason,
+                )
+
+            if event_type in {
+                "customer.subscription.deleted",
+                "customer.subscription.updated",
+            }:
+                fulfillment_result = fulfill_stripe_subscription_event(
+                    db=db,
+                    event=event,
+                    stripe_event=stripe_event,
+                )
+                return StripeProcessResult(
+                    processed=fulfillment_result.processed,
+                    telegram_id=fulfillment_result.telegram_id,
+                    subscription_id=fulfillment_result.subscription_id,
+                    subscription_status=fulfillment_result.subscription_status,
+                    access_action=fulfillment_result.access_action,
+                    reason=fulfillment_result.reason,
+                )
+
             if event_type != "checkout.session.completed":
                 return StripeProcessResult(processed=False, reason="ignored_event_type")
-
-            fulfillment_result = fulfill_checkout_session_completed(
-                db=db,
-                event=event,
-                stripe_event=stripe_event,
-                settings=settings,
-            )
-            return StripeProcessResult(
-                processed=fulfillment_result.processed,
-                telegram_id=fulfillment_result.telegram_id,
-                reason=fulfillment_result.reason,
-            )
     except IntegrityError as error:
         db.rollback()
         logger.info("Stripe event id=%s was already stored.", event_id)

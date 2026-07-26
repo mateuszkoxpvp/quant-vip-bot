@@ -59,6 +59,9 @@ PLAN_PAYMENT_LINK_SETTINGS = {
 class FulfillmentResult:
     processed: bool
     telegram_id: int | None = None
+    subscription_id: int | None = None
+    subscription_status: str | None = None
+    access_action: str | None = None
     reason: str | None = None
 
 
@@ -70,6 +73,75 @@ class PlanDuration:
     @property
     def is_valid(self) -> bool:
         return self.reason is None
+
+
+ACTIVE_SUBSCRIPTION_STATUSES = {"active", "trialing"}
+REVOKE_SUBSCRIPTION_STATUSES = {
+    "canceled",
+    "cancelled",
+    "incomplete_expired",
+    "unpaid",
+}
+GRACE_SUBSCRIPTION_STATUSES = {"past_due", "incomplete"}
+TRIAL_METADATA_KEYS = {"trial", "is_trial", "allow_trial"}
+TRIAL_METADATA_VALUES = {"1", "true", "yes", "trial"}
+INVITE_LINK_TTL_DAYS = 7
+
+
+def normalize_subscription_status(status: Any) -> str:
+    return str(status or "").strip().lower()
+
+
+def as_utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def datetime_after(left: datetime, right: datetime) -> bool:
+    return as_utc_datetime(left) > as_utc_datetime(right)
+
+
+def datetime_before(left: datetime, right: datetime) -> bool:
+    return as_utc_datetime(left) < as_utc_datetime(right)
+
+
+def subscription_is_current(subscription: Subscription, now: datetime) -> bool:
+    status = normalize_subscription_status(subscription.status)
+    if status not in ACTIVE_SUBSCRIPTION_STATUSES:
+        return False
+
+    return subscription.ends_at is None or datetime_after(subscription.ends_at, now)
+
+
+def subscription_needs_revoke(subscription: Subscription, now: datetime) -> bool:
+    status = normalize_subscription_status(subscription.status)
+    if status in REVOKE_SUBSCRIPTION_STATUSES:
+        return True
+
+    return (
+        status in ACTIVE_SUBSCRIPTION_STATUSES
+        and subscription.ends_at is not None
+        and not datetime_after(subscription.ends_at, now)
+    )
+
+
+def subscription_needs_grant(subscription: Subscription, now: datetime) -> bool:
+    invite_sent_at = subscription.telegram_invite_sent_at
+    has_valid_invite = (
+        normalize_subscription_status(subscription.telegram_access_status)
+        == "invite_sent"
+        and invite_sent_at is not None
+        and datetime_after(invite_sent_at + timedelta(days=INVITE_LINK_TTL_DAYS), now)
+    )
+
+    return subscription_is_current(subscription, now) and (
+        (
+            subscription.telegram_access_granted_at is None
+            and not has_valid_invite
+        )
+        or subscription.telegram_access_revoked_at is not None
+    )
 
 
 def as_plain_mapping(value: Any) -> dict[str, Any]:
@@ -110,6 +182,11 @@ def canonical_plan_code(value: Any) -> str:
 
 
 def checkout_session_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    data = as_plain_mapping(event.get("data"))
+    return as_plain_mapping(data.get("object"))
+
+
+def stripe_subscription_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
     data = as_plain_mapping(event.get("data"))
     return as_plain_mapping(data.get("object"))
 
@@ -363,6 +440,37 @@ def stripe_datetime(value: Any) -> datetime | None:
         return None
 
 
+def stripe_event_created(event: Mapping[str, Any], now: datetime) -> datetime:
+    return stripe_datetime(event.get("created")) or now
+
+
+def true_metadata_value(value: Any) -> bool:
+    return str(value or "").strip().lower() in TRIAL_METADATA_VALUES
+
+
+def session_is_supported_trial(
+    session: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> bool:
+    subscription = as_plain_mapping(session.get("subscription"))
+    if normalize_subscription_status(subscription.get("status")) != "trialing":
+        return False
+
+    return any(true_metadata_value(metadata.get(key)) for key in TRIAL_METADATA_KEYS)
+
+
+def checkout_session_allows_access(session: Mapping[str, Any]) -> bool:
+    metadata = as_plain_mapping(session.get("metadata"))
+    payment_status = str(session.get("payment_status") or "").strip().lower()
+    if payment_status == "paid":
+        return True
+
+    return (
+        payment_status == "no_payment_required"
+        and session_is_supported_trial(session, metadata)
+    )
+
+
 def checkout_status(session: Mapping[str, Any]) -> str:
     subscription = as_plain_mapping(session.get("subscription"))
     subscription_status = subscription.get("status")
@@ -394,6 +502,42 @@ def upsert_user_from_checkout_session(
     return user
 
 
+def existing_checkout_subscription(
+    db: Session,
+    session: Mapping[str, Any],
+) -> Subscription | None:
+    checkout_session_id = object_id(session.get("id"))
+    stripe_subscription_id = object_id(session.get("subscription"))
+
+    if checkout_session_id:
+        subscription = db.scalar(
+            select(Subscription).where(
+                Subscription.stripe_checkout_session_id == checkout_session_id
+            )
+        )
+        if subscription is not None:
+            return subscription
+
+    if stripe_subscription_id:
+        return db.scalar(
+            select(Subscription).where(
+                Subscription.stripe_subscription_id == stripe_subscription_id
+            )
+        )
+
+    return None
+
+
+def subscription_event_is_stale(
+    subscription: Subscription,
+    event_created: datetime,
+) -> bool:
+    return (
+        subscription.last_stripe_event_created is not None
+        and datetime_before(event_created, subscription.last_stripe_event_created)
+    )
+
+
 def upsert_subscription_from_checkout_session(
     db: Session,
     session: Mapping[str, Any],
@@ -401,24 +545,12 @@ def upsert_subscription_from_checkout_session(
     plan: Plan,
     now: datetime,
     duration: PlanDuration,
+    event_created: datetime,
 ) -> Subscription:
     checkout_session_id = object_id(session.get("id"))
     stripe_subscription_id = object_id(session.get("subscription"))
 
-    subscription = None
-    if checkout_session_id:
-        subscription = db.scalar(
-            select(Subscription).where(
-                Subscription.stripe_checkout_session_id == checkout_session_id
-            )
-        )
-
-    if subscription is None and stripe_subscription_id:
-        subscription = db.scalar(
-            select(Subscription).where(
-                Subscription.stripe_subscription_id == stripe_subscription_id
-            )
-        )
+    subscription = existing_checkout_subscription(db, session)
 
     if subscription is None:
         subscription = Subscription(
@@ -429,6 +561,11 @@ def upsert_subscription_from_checkout_session(
         )
         db.add(subscription)
     else:
+        if (
+            subscription.last_stripe_event_created is not None
+            and datetime_before(event_created, subscription.last_stripe_event_created)
+        ):
+            return subscription
         subscription.user = user
         subscription.plan = plan
 
@@ -456,6 +593,7 @@ def upsert_subscription_from_checkout_session(
     )
     subscription.ends_at = ends_at
     subscription.canceled_at = stripe_datetime(subscription_payload.get("canceled_at"))
+    subscription.last_stripe_event_created = event_created
 
     db.flush()
     return subscription
@@ -471,6 +609,17 @@ def fulfill_checkout_session_completed(
     if not session:
         logger.warning("checkout.session.completed missing data.object.")
         return FulfillmentResult(processed=False, reason="missing_checkout_session")
+
+    now = datetime.now(UTC)
+    event_created = stripe_event_created(event, now)
+
+    if not checkout_session_allows_access(session):
+        logger.warning(
+            "checkout.session.completed id=%s has unsupported payment_status=%s.",
+            session.get("id"),
+            session.get("payment_status"),
+        )
+        return FulfillmentResult(processed=False, reason="unsupported_payment_status")
 
     telegram_id = parse_telegram_id(session)
     if telegram_id is None:
@@ -501,6 +650,15 @@ def fulfill_checkout_session_completed(
         )
         return FulfillmentResult(processed=False, reason=duration.reason)
 
+    existing_subscription = existing_checkout_subscription(db, session)
+    if existing_subscription is not None and subscription_event_is_stale(
+        existing_subscription,
+        event_created,
+    ):
+        stripe_event.processed_at = now
+        db.flush()
+        return FulfillmentResult(processed=False, reason="out_of_order_event")
+
     plan = resolve_plan(db, session, settings)
     if plan is None:
         logger.warning(
@@ -518,7 +676,6 @@ def fulfill_checkout_session_completed(
         )
         return FulfillmentResult(processed=False, reason=duration.reason)
 
-    now = datetime.now(UTC)
     user = upsert_user_from_checkout_session(db, session, telegram_id)
     subscription = upsert_subscription_from_checkout_session(
         db=db,
@@ -527,6 +684,7 @@ def fulfill_checkout_session_completed(
         plan=plan,
         now=now,
         duration=duration,
+        event_created=event_created,
     )
 
     stripe_event.processed_at = now
@@ -538,4 +696,110 @@ def fulfill_checkout_session_completed(
         telegram_id,
         subscription.id,
     )
-    return FulfillmentResult(processed=True, telegram_id=telegram_id)
+    access_action = "grant" if subscription_needs_grant(subscription, now) else None
+    return FulfillmentResult(
+        processed=True,
+        telegram_id=telegram_id,
+        subscription_id=subscription.id,
+        subscription_status=subscription.status,
+        access_action=access_action,
+    )
+
+
+def update_subscription_from_stripe_payload(
+    subscription: Subscription,
+    subscription_payload: Mapping[str, Any],
+    event_type: str,
+    now: datetime,
+) -> None:
+    if event_type == "customer.subscription.deleted":
+        status = "canceled"
+    else:
+        status = normalize_subscription_status(subscription_payload.get("status"))
+    if status:
+        subscription.status = status
+
+    period_start = stripe_datetime(subscription_payload.get("current_period_start"))
+    if period_start is not None:
+        subscription.current_period_start = period_start
+
+    period_end = stripe_datetime(subscription_payload.get("current_period_end"))
+    if period_end is not None:
+        subscription.current_period_end = period_end
+        if subscription.plan.code != "lifetime":
+            subscription.ends_at = period_end
+    elif subscription.plan.code == "lifetime":
+        subscription.current_period_end = None
+        subscription.ends_at = None
+
+    canceled_at = (
+        stripe_datetime(subscription_payload.get("canceled_at"))
+        or stripe_datetime(subscription_payload.get("ended_at"))
+    )
+    if normalize_subscription_status(subscription.status) in REVOKE_SUBSCRIPTION_STATUSES:
+        subscription.canceled_at = canceled_at or subscription.canceled_at or now
+        subscription.ends_at = subscription.canceled_at
+
+
+def fulfill_stripe_subscription_event(
+    db: Session,
+    event: Mapping[str, Any],
+    stripe_event: StripeEvent,
+) -> FulfillmentResult:
+    subscription_payload = stripe_subscription_from_event(event)
+    stripe_subscription_id = object_id(subscription_payload.get("id"))
+    if stripe_subscription_id is None:
+        logger.warning("%s missing subscription id.", event.get("type"))
+        return FulfillmentResult(processed=False, reason="missing_stripe_subscription_id")
+
+    subscription = db.scalar(
+        select(Subscription).where(
+            Subscription.stripe_subscription_id == stripe_subscription_id
+        )
+    )
+    if subscription is None:
+        logger.warning(
+            "%s references unknown Stripe subscription id=%s.",
+            event.get("type"),
+            stripe_subscription_id,
+        )
+        return FulfillmentResult(processed=False, reason="unknown_subscription")
+
+    now = datetime.now(UTC)
+    event_created = stripe_event_created(event, now)
+    if subscription_event_is_stale(subscription, event_created):
+        stripe_event.processed_at = now
+        db.flush()
+        return FulfillmentResult(processed=False, reason="out_of_order_event")
+
+    update_subscription_from_stripe_payload(
+        subscription=subscription,
+        subscription_payload=subscription_payload,
+        event_type=str(event.get("type")),
+        now=now,
+    )
+    subscription.last_stripe_event_created = event_created
+    stripe_event.processed_at = now
+    db.flush()
+
+    access_action = None
+    if event.get("type") == "customer.subscription.deleted":
+        access_action = "revoke"
+    elif subscription_needs_revoke(subscription, now):
+        access_action = "revoke"
+    elif subscription_needs_grant(subscription, now):
+        access_action = "grant"
+
+    logger.info(
+        "Updated subscription id=%s from Stripe event type=%s status=%s.",
+        subscription.id,
+        event.get("type"),
+        subscription.status,
+    )
+    return FulfillmentResult(
+        processed=True,
+        telegram_id=subscription.user.telegram_id,
+        subscription_id=subscription.id,
+        subscription_status=subscription.status,
+        access_action=access_action,
+    )

@@ -35,6 +35,8 @@ class Settings:
     payment_link_6_months: str
     payment_link_lifetime: str
     stripe_webhook_secret: str
+    telegram_group_id: int | str
+    access_check_interval_seconds: int = 300
 
 
 dp = Dispatcher()
@@ -53,6 +55,55 @@ def validate_payment_link(env_name: str, value: str) -> str:
             f"Invalid value for {env_name}: expected an absolute HTTPS URL."
         )
     return value
+
+
+def parse_telegram_group_id(value: str) -> int | str:
+    value = value.strip()
+    if not value:
+        raise RuntimeError("Invalid value for TELEGRAM_GROUP_ID: value cannot be empty.")
+
+    try:
+        return int(value)
+    except ValueError:
+        if value.startswith("@") and len(value) > 1:
+            return value
+        raise RuntimeError(
+            "Invalid value for TELEGRAM_GROUP_ID: expected numeric chat ID or @username."
+        )
+
+
+def parse_positive_int(env_name: str, value: str, default: int) -> int:
+    if not value:
+        return default
+
+    try:
+        parsed_value = int(value)
+    except ValueError as error:
+        raise RuntimeError(f"Invalid value for {env_name}: expected an integer.") from error
+
+    if parsed_value < 60 or parsed_value > 86_400:
+        raise RuntimeError(
+            f"Invalid value for {env_name}: expected an integer from 60 to 86400."
+        )
+
+    return parsed_value
+
+
+def load_telegram_group_id() -> int | str:
+    telegram_group_id = os.getenv("TELEGRAM_GROUP_ID")
+    if telegram_group_id:
+        return parse_telegram_group_id(telegram_group_id)
+
+    legacy_group_id = os.getenv("GROUP_ID")
+    if legacy_group_id:
+        logger.warning(
+            "GROUP_ID is deprecated; use TELEGRAM_GROUP_ID for the VIP group."
+        )
+        return parse_telegram_group_id(legacy_group_id)
+
+    raise RuntimeError(
+        "Missing required environment variable(s): TELEGRAM_GROUP_ID or GROUP_ID"
+    )
 
 
 def load_settings() -> Settings:
@@ -76,6 +127,12 @@ def load_settings() -> Settings:
             "PAYMENT_LINK_LIFETIME", os.environ["PAYMENT_LINK_LIFETIME"]
         ),
         stripe_webhook_secret=os.environ["STRIPE_WEBHOOK_SECRET"],
+        telegram_group_id=load_telegram_group_id(),
+        access_check_interval_seconds=parse_positive_int(
+            "ACCESS_CHECK_INTERVAL_SECONDS",
+            os.getenv("ACCESS_CHECK_INTERVAL_SECONDS", ""),
+            default=300,
+        ),
     )
 
 

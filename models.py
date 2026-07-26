@@ -102,6 +102,15 @@ class Subscription(Base):
         Index("ix_subscriptions_user_id", "user_id"),
         Index("ix_subscriptions_plan_id", "plan_id"),
         Index("ix_subscriptions_status", "status"),
+        Index("ix_subscriptions_ends_at", "ends_at"),
+        Index("ix_subscriptions_access_grant_scan", "status", "telegram_access_retry_at"),
+        Index(
+            "ix_subscriptions_access_revoke_scan",
+            "telegram_access_revoked_at",
+            "status",
+            "ends_at",
+        ),
+        Index("ix_subscriptions_telegram_access_revoked_at", "telegram_access_revoked_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -127,6 +136,26 @@ class Subscription(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_stripe_event_created: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    telegram_access_status: Mapped[str | None] = mapped_column(String(32))
+    telegram_access_error: Mapped[str | None] = mapped_column(String(255))
+    telegram_access_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    telegram_access_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    telegram_invite_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    telegram_access_granted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    telegram_access_revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
